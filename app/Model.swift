@@ -375,7 +375,6 @@ final class ScanModel {
         scanning = true
         startedAt = Date()
         scanNumber += 1
-        showSavedScan(of: scanRoot, scan: scanNumber)
         // Keep the process out of App Nap / timer coalescing while scanning.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .latencyCritical],
@@ -386,7 +385,7 @@ final class ScanModel {
         // the main thread never waits synchronously on that service.
         let volumePath = scanRoot
         volumeTask = Task.detached(priority: .userInitiated) { VolumeSpace.read(volumePath) }
-        handle = bz_scan_start(scanRoot)
+        showSavedScan(of: scanRoot, scan: scanNumber)
 
         // 60 Hz: the elapsed time ticks every frame, so the screen keeps
         // moving while the engine assembles the tree after the last file is
@@ -402,8 +401,10 @@ final class ScanModel {
     private var lastPollAt: Date?
     private var maxPollGap: Double = 0
 
-    /// Load the last saved scan of `root` alongside the real scan and show it
-    /// until that one finishes. A missing or unusable file is skipped.
+    /// Load the last saved scan of `root` and show it until the real scan
+    /// finishes. The real scan starts once loading ends: run together, both
+    /// compete for every core and the saved scan took 5x longer to appear.
+    /// A missing or unusable file is skipped.
     private func showSavedScan(of root: String, scan: Int) {
         let file = ScanCache.file(for: root)
         Task {
@@ -413,6 +414,7 @@ final class ScanModel {
                 if saved == nil { bz_free(h) }
                 return saved
             }.value
+            if scan == scanNumber, scanning, handle == nil { handle = bz_scan_start(root) }
             guard let saved, scan == scanNumber, scanning, tree == nil else { return }
             tree = saved
             hasShownTree = true
