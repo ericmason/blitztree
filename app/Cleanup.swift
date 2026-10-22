@@ -125,6 +125,8 @@ struct CleanupPanel: View {
                     ))
                     .labelsHidden()
                     .toggleStyle(.checkbox)
+                    // Nothing is picked by sizes that may be out of date.
+                    .disabled(model.showingSaved)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(item.display)
                             .lineLimit(1)
@@ -153,7 +155,7 @@ struct CleanupPanel: View {
             Divider()
             VStack(spacing: 8) {
                 agentButton
-                    .disabled(model.cleanupTrash.running)
+                    .disabled(model.cleanupTrash.running || model.scanning)
                 Button {
                     confirming = true
                 } label: {
@@ -164,8 +166,9 @@ struct CleanupPanel: View {
                 .buttonStyle(.bordered)
                 .controlSize(.large)
                 .disabled(pickedItems.isEmpty || model.scanning || model.cleanupTrash.running)
-                // The saved results may be out of date; nothing is deleted from them.
-                if model.showingSaved {
+                // Results on screen during a scan may be out of date: nothing
+                // is deleted or sent to an agent from them.
+                if model.scanning, model.tree != nil {
                     Text("Waiting for the fresh scan")
                         .font(.caption)
                         .foregroundStyle(.secondary)

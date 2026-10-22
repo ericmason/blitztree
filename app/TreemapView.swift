@@ -463,7 +463,7 @@ final class TreemapNSView: NSView {
         guard let model, let tree = model.tree, let leaf = hit(p) else { return }
         model.selection = leaf.node
         syncOverlay()
-        NodeMenu.popUp(path: tree.path(leaf.node), with: event, for: self)
+        NodeMenu.popUp(path: tree.path(leaf.node), model: model, with: event, for: self)
     }
 }
 
@@ -523,16 +523,30 @@ nonisolated private enum Scan {
 final class NodeMenu: NSObject {
     private static let shared = NodeMenu()
 
-    static func popUp(path: String, with event: NSEvent, for view: NSView) {
+    /// Move to Trash waits while a scan runs or saved results show: the
+    /// path on screen may no longer be what the size describes.
+    @MainActor static func popUp(path: String, model: ScanModel, with event: NSEvent, for view: NSView) {
         let menu = NSMenu()
+        menu.autoenablesItems = false
+        let waiting = model.scanning || model.showingSaved
         for (title, action) in [("Reveal in Finder", #selector(revealInFinder(_:))),
                                 ("Copy Path", #selector(copyPath(_:))),
                                 ("Move to Trash", #selector(moveToTrash(_:)))] {
-            if action == #selector(moveToTrash(_:)) { menu.addItem(.separator()) }
+            let trash = action == #selector(moveToTrash(_:))
+            if trash { menu.addItem(.separator()) }
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = shared
             item.representedObject = path
+            if trash, waiting {
+                item.isEnabled = false
+                item.toolTip = "Waiting for the fresh scan"
+            }
             menu.addItem(item)
+        }
+        if waiting {
+            let note = NSMenuItem(title: "Waiting for the fresh scan", action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
         }
         NSMenu.popUpContextMenu(menu, with: event, for: view)
     }

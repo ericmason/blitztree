@@ -96,6 +96,31 @@ nonisolated final class Tree: @unchecked Sendable {
         return cur
     }
 
+    /// `node(at:)` for many paths at once. Each folder's children are indexed
+    /// by name the first time a path goes through it, so paths sharing a big
+    /// folder don't each search it.
+    func nodes(at paths: [[[UInt8]]]) -> [Int?] {
+        var index: [Int: [[UInt8]: Int]] = [:]
+        return paths.map { names in
+            var cur = 0
+            for name in names {
+                if index[cur] == nil {
+                    let kids = children(cur)
+                    var byName = [[UInt8]: Int](minimumCapacity: kids.count)
+                    for child in kids {
+                        let start = Int(nameOff[Int(child)])
+                        let count = Int(nameOff[Int(child) + 1]) - start
+                        byName[Array(UnsafeBufferPointer(start: nameBlob + start, count: count))] = Int(child)
+                    }
+                    index[cur] = byName
+                }
+                guard let next = index[cur]?[name] else { return nil }
+                cur = next
+            }
+            return cur
+        }
+    }
+
     func isDir(_ i: Int) -> Bool { flags[i] & 1 != 0 }
 
     /// Bytes shared with APFS clones and counted elsewhere.

@@ -9,7 +9,7 @@
 //! Layout, integers little-endian:
 //!
 //! ```text
-//! magic "BZCACHE\0", format version u32,
+//! magic "BZCACHE\0", format version u32, `SIZE_RULES` u32,
 //! root path (u32 length + UTF-8), scan start (i64 ms since 1970),
 //! volume UUID [u8; 16], node count u64, error count u64,
 //! FNV-1a 64 of everything above,
@@ -28,15 +28,17 @@
 use std::ffi::{c_void, CString};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 
-use crate::{getattrlist, total_and_link, AttrList, CloneGroup, Tree, ATTR_BIT_MAP_COUNT, NO_PARENT};
+use crate::{getattrlist, total_and_link, AttrList, CloneGroup, Tree, ATTR_BIT_MAP_COUNT, NO_PARENT, SIZE_RULES};
 
 const MAGIC: &[u8; 8] = b"BZCACHE\0";
-/// Bump whenever the layout or the meaning of a column changes.
-pub const VERSION: u32 = 1;
+/// Bump whenever the layout or the meaning of a column changes. Changes to
+/// how a scan counts sizes bump `crate::SIZE_RULES` instead.
+pub const VERSION: u32 = 2;
 /// zstd level: 3 makes files about 20% larger than 9 in under half the
 /// time, and 6 saves only a few percent more (see BENCHMARKS.md).
 pub const LEVEL: i32 = 3;
@@ -44,6 +46,8 @@ pub const LEVEL: i32 = 3;
 /// on every core.
 const CHUNK: usize = 8 << 20;
 const COLUMNS: usize = 11;
+/// Most a file's columns may unpack to, as a multiple of the file's size.
+const MAX_RATIO: u64 = 64;
 
 /// What identifies the scan a cache belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +223,7 @@ fn header_bytes(h: &Header, nodes: u64, errors: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + h.root.len());
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&SIZE_RULES.to_le_bytes());
     out.extend_from_slice(&(h.root.len() as u32).to_le_bytes());
     out.extend_from_slice(h.root.as_bytes());
     let ms = match h.scanned_at.duration_since(UNIX_EPOCH) {
@@ -293,12 +298,24 @@ pub fn save(t: &Tree, root: &Path, scanned_at: SystemTime, dest: &Path) -> io::R
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // Each save gets its own temporary file, so two saves of the same folder
+    // never write into one; the last rename wins.
+    static SAVES: AtomicU64 = AtomicU64::new(0);
     let mut tmp = dest.as_os_str().to_owned();
-    tmp.push(format!(".tmp-{}", std::process::id()));
-    let result = std::fs::File::create(&tmp)
-        .and_then(|mut f| f.write_all(&bytes))
+    tmp.push(format!(".tmp-{}-{}", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
+    let mut created = false;
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            created = true;
+            f.write_all(&bytes)?;
+            f.sync_all()
+        })
         .and_then(|_| std::fs::rename(&tmp, dest));
-    if result.is_err() {
+    // A file that create_new refused belongs to someone else.
+    if result.is_err() && created {
         let _ = std::fs::remove_file(&tmp);
     }
     result.map(|_| sizes)
@@ -334,6 +351,9 @@ fn read_header(r: &mut Reader) -> io::Result<(Header, u64, u64)> {
     }
     if r.u32()? != VERSION {
         return Err(invalid("cache is from another version"));
+    }
+    if r.u32()? != SIZE_RULES {
+        return Err(invalid("cache counted sizes another way"));
     }
     let root_len = r.u32()? as usize;
     let root = std::str::from_utf8(r.take(root_len)?).map_err(|_| invalid("root path is not UTF-8"))?;
@@ -376,7 +396,12 @@ fn chunk_table<'a>(r: &mut Reader<'a>, max_raw: u64) -> io::Result<(usize, Vec<(
             return Err(invalid("chunk is too long"));
         }
         total += raw_len;
-        chunks.push((raw_len, r.take(packed_len)?));
+        let frame = r.take(packed_len)?;
+        // zstd records each frame's size; it must agree with the table.
+        if !matches!(zstd::zstd_safe::get_frame_content_size(frame), Ok(Some(s)) if s == raw_len as u64) {
+            return Err(invalid("chunk length doesn't match its frame"));
+        }
+        chunks.push((raw_len, frame));
     }
     if total as u64 != raw {
         return Err(invalid("chunk lengths don't add up"));
@@ -411,6 +436,17 @@ pub fn decode(bytes: &[u8], root: &str, volume: [u8; 16]) -> io::Result<(Tree, S
     }
     if r.at != bytes.len() {
         return Err(invalid("file has extra bytes"));
+    }
+    // Memory is allocated from the declared counts, so tie them to the
+    // file's size: a small damaged file must not ask for gigabytes. Measured
+    // scans took 5 to 13 bytes per node on disk and their columns compressed
+    // 3 to 6 times, so these limits leave a wide margin.
+    if nodes > bytes.len() as u64 {
+        return Err(invalid("too many nodes for the file size"));
+    }
+    let raw_total: u64 = tables.iter().map(|(raw, _)| *raw as u64).sum();
+    if raw_total > MAX_RATIO * bytes.len() as u64 {
+        return Err(invalid("columns too large for the file size"));
     }
 
     // Decompress every chunk of every column in parallel, in place.
@@ -484,6 +520,18 @@ pub fn decode(bytes: &[u8], root: &str, volume: [u8; 16]) -> io::Result<(Tree, S
         return Err(invalid("names don't add up"));
     }
     t.name_blob = std::mem::take(&mut cols[7]);
+    // Paths are built by joining names, so each must be one real name.
+    if t.name_bytes(0) != h.root.as_bytes() {
+        return Err(invalid("root name doesn't match the folder"));
+    }
+    (1..n).into_par_iter().try_for_each(|i| {
+        let name = t.name_bytes(i);
+        let bad = name.is_empty() || name == b"." || name == b".." || name.contains(&b'/');
+        if bad || std::str::from_utf8(name).is_err() {
+            return Err(invalid("bad name"));
+        }
+        Ok(())
+    })?;
 
     let node = |v: u64| match u32_value(v) {
         Ok(i) if (i as usize) < n => Ok(i),
@@ -661,8 +709,72 @@ mod tests {
         newer[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
         let err = decode(&newer, "/r", h.volume).unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
+        let mut recounted = bytes.clone();
+        recounted[12..16].copy_from_slice(&(SIZE_RULES + 1).to_le_bytes());
+        let err = decode(&recounted, "/r", h.volume).unwrap_err();
+        assert!(err.to_string().contains("sizes another way"), "{err}");
         assert!(decode(&bytes, "/other", h.volume).is_err());
         assert!(decode(&bytes, "/r", [2; 16]).is_err());
+    }
+
+    /// A well-formed file whose columns are all zeros of the given lengths.
+    fn zeros_file(nodes: u64, raws: [u64; COLUMNS]) -> Vec<u8> {
+        let h = Header { root: "/r".into(), scanned_at: UNIX_EPOCH, volume: [1; 16] };
+        let zeros = vec![0u8; CHUNK];
+        let mut out = header_bytes(&h, nodes, 0);
+        for raw in raws {
+            let raw = raw as usize;
+            let frames: Vec<Vec<u8>> = (0..raw.div_ceil(CHUNK))
+                .map(|k| zstd::bulk::compress(&zeros[..CHUNK.min(raw - k * CHUNK)], LEVEL).unwrap())
+                .collect();
+            out.extend_from_slice(&(raw as u64).to_le_bytes());
+            out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+            for (k, f) in frames.iter().enumerate() {
+                out.extend_from_slice(&(CHUNK.min(raw - k * CHUNK) as u32).to_le_bytes());
+                out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            }
+            for f in &frames {
+                out.extend_from_slice(f);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_small_file_cannot_ask_for_much_memory() {
+        // 50M nodes of one byte per column: 350 MB of columns.
+        let n = 50_000_000;
+        let many_nodes = zeros_file(n, [n, n, n, n, n, n, n, 0, 0, 0, 0]);
+        assert!(many_nodes.len() < 1 << 20, "{}", many_nodes.len());
+        let err = decode(&many_nodes, "/r", [1; 16]).unwrap_err();
+        assert!(err.to_string().contains("too many nodes"), "{err}");
+        // Few nodes, but 1 GB of names.
+        let long_names = zeros_file(1000, [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1 << 30, 0, 0, 0]);
+        assert!(long_names.len() < 1 << 20, "{}", long_names.len());
+        let err = decode(&long_names, "/r", [1; 16]).unwrap_err();
+        assert!(err.to_string().contains("columns too large"), "{err}");
+    }
+
+    #[test]
+    fn names_that_would_make_bad_paths_are_rejected() {
+        let build = |root: &str, name: &[u8]| {
+            let mut t = Tree::with_root(root);
+            t.push("d", 0, 0, 0, true);
+            t.push("ok", 1, 5, 4096, false);
+            let at = t.name_off[2] as usize;
+            t.name_blob.splice(at..at + 2, name.iter().copied());
+            t.name_off[3] = (at + name.len()) as u32;
+            total_and_link(&mut t);
+            let h = Header { root: "/r".into(), scanned_at: UNIX_EPOCH, volume: [1; 16] };
+            decode(&encode(&t, &h, LEVEL).unwrap().0, "/r", [1; 16])
+        };
+        assert!(build("/r", b"fine name").is_ok());
+        let err = build("/elsewhere", b"ok").unwrap_err();
+        assert!(err.to_string().contains("root name"), "{err}");
+        for name in [&b""[..], b".", b"..", b"a/b", b"/", b"\xff\xfe"] {
+            let err = build("/r", name).unwrap_err();
+            assert!(err.to_string().contains("bad name"), "{name:?}: {err}");
+        }
     }
 
     #[test]

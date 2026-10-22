@@ -79,6 +79,11 @@ const BUF_SIZE: usize = 256 * 1024;
 
 // ---- Tree model ----
 
+/// Bump whenever a scan counts, attributes or flags sizes differently, so
+/// results saved by an older build (see `cache`) are not shown as current.
+/// 1: APFS clones count once, toward the lowest file id.
+pub const SIZE_RULES: u32 = 1;
+
 pub const NO_PARENT: u32 = u32::MAX;
 
 /// The finished tree as flat arrays, the layout the Swift UI reads in place

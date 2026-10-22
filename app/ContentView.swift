@@ -557,8 +557,8 @@ struct OutlinePanel: NSViewRepresentable {
                     roots = childIDs.map { Item(id: Int($0), tree: t) }
                     outline?.reloadData()
                     // In row order, so each folder opens after its parent.
-                    for names in reopen {
-                        if let node = t.node(at: names), let it = item(for: node) { outline?.expandItem(it) }
+                    for node in t.nodes(at: reopen) {
+                        if let node, let it = item(for: node) { outline?.expandItem(it) }
                     }
                 }
                 if ProcessInfo.processInfo.environment["BZ_TIMING"] != nil {

@@ -635,7 +635,7 @@ final class SunburstNSView: NSView {
         else { return }
         model.selection = segments[i].node
         needsDisplay = true
-        NodeMenu.popUp(path: tree.path(segments[i].node), with: event, for: self)
+        NodeMenu.popUp(path: tree.path(segments[i].node), model: model, with: event, for: self)
     }
 }
 
