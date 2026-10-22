@@ -146,6 +146,17 @@ fn main() {
                 c.errors.load(Ordering::Relaxed),
             )
         }
+        "cache" => {
+            let progress = Progress::default();
+            let tree = scan(&path, &progress);
+            cache_report(&tree, &path);
+            (
+                tree.n_files[0] as u64,
+                progress.dirs.load(Ordering::Relaxed),
+                tree.alloc[0],
+                tree.errors,
+            )
+        }
         m => {
             eprintln!("unknown mode {m}");
             std::process::exit(1);
@@ -164,6 +175,85 @@ fn main() {
         bytes as f64 / 1e9,
         total as f64 / dt.as_secs_f64()
     );
+}
+
+/// Saved-scan size and speed for one scanned tree: encoded and compressed
+/// size per zstd level, then a real save and load at the shipped level.
+/// Load is measured to a usable handle (read, decompress, rebuild totals
+/// and child lists, Clean Up candidates), best of three.
+fn cache_report(tree: &blitztree::Tree, root: &Path) {
+    use blitztree::cache;
+    use std::time::{Duration, SystemTime};
+    let n = tree.len();
+    let memory = 4 * n // parents
+        + 3 * 8 * n // alloc, unique, logical
+        + 4 * n // n_files
+        + 2 * n // flags, complete
+        + 4 * (n + 1) + 4 * n.saturating_sub(1) // child_off, children
+        + 4 * (n + 1) + tree.name_blob.len() // names
+        + 4 * tree.clone_members.len() + 12 * tree.clone_groups.len() + 4 * tree.partial_clones.len();
+    let names = tree.name_blob.len();
+    println!("cache: {n} nodes, {:.1} MB columns in memory ({:.1} MB of names)", memory as f64 / 1e6, names as f64 / 1e6);
+    let header = cache::Header {
+        root: root.to_string_lossy().into_owned(),
+        scanned_at: SystemTime::now(),
+        volume: cache::volume_id(root).unwrap_or_default(),
+    };
+    let levels: Vec<i32> = std::env::var("BZ_LEVELS")
+        .map(|s| s.split(',').map(|l| l.parse().expect("BZ_LEVELS: comma-separated integers")).collect())
+        .unwrap_or_else(|_| vec![1, 3, 6, 9]);
+    for level in levels {
+        let t = Instant::now();
+        let (_, sizes) = cache::encode(tree, &header, level).unwrap();
+        println!(
+            "  level {level:>2}: encoded {:.1} MB -> file {:.1} MB in {:.3}s",
+            sizes.encoded as f64 / 1e6,
+            sizes.file as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+        if level == cache::LEVEL {
+            for (name, encoded, packed) in &sizes.columns {
+                println!("    {name:>14}: {:>7.1} MB -> {:>6.1} MB", *encoded as f64 / 1e6, *packed as f64 / 1e6);
+            }
+        }
+    }
+    // What storing folder totals instead of rebuilding them would add.
+    let mut totals = Vec::new();
+    for i in (0..n).filter(|&i| tree.is_dir(i)) {
+        for v in [tree.alloc[i], tree.unique[i], tree.logical[i], tree.n_files[i] as u64] {
+            let mut v = v;
+            while v >= 0x80 {
+                totals.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            totals.push(v as u8);
+        }
+    }
+    let packed = zstd::bulk::compress(&totals, cache::LEVEL).unwrap();
+    println!(
+        "  stored folder totals would add {:.1} MB encoded, {:.1} MB compressed",
+        totals.len() as f64 / 1e6,
+        packed.len() as f64 / 1e6
+    );
+
+    let dir = std::env::temp_dir().join(format!("bz-cache-bench-{}", std::process::id()));
+    let file = dir.join("scan.bzcache");
+    let t = Instant::now();
+    let sizes = cache::save(tree, root, SystemTime::now(), &file).unwrap();
+    println!("  save at level {}: {:.3}s, {:.1} MB", cache::LEVEL, t.elapsed().as_secs_f64(), sizes.file as f64 / 1e6);
+    let cache_c = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+    let root_c = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let h = blitztree::ffi::bz_cache_load(cache_c.as_ptr(), root_c.as_ptr());
+        assert!(!h.is_null(), "cache didn't load");
+        assert_eq!(blitztree::ffi::bz_take_tree(h) as usize, n);
+        best = best.min(t.elapsed());
+        blitztree::ffi::bz_free(h);
+    }
+    println!("  load to usable: {:.3}s (best of 3)", best.as_secs_f64());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[derive(Default)]

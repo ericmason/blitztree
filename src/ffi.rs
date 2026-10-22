@@ -6,8 +6,9 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{cleanup, scan, Progress, Tree};
+use crate::{cache, cleanup, scan, Progress, Tree};
 
 pub struct BzScan {
     progress: Arc<Progress>,
@@ -22,9 +23,12 @@ struct Flat {
     tree: Tree,
     cleanup_nodes: Vec<u32>,
     cleanup_descriptions: Vec<CString>,
+    root: PathBuf,
+    /// When the scan started, so a saved copy can say how old it is.
+    scanned_at: SystemTime,
 }
 
-fn with_cleanup(tree: Tree) -> Flat {
+fn with_cleanup(tree: Tree, root: PathBuf, scanned_at: SystemTime) -> Flat {
     let candidates = cleanup::find(&tree, cleanup::MIN_BYTES);
     Flat {
         cleanup_nodes: candidates.iter().map(|c| c.node).collect(),
@@ -33,14 +37,20 @@ fn with_cleanup(tree: Tree) -> Flat {
             .map(|c| CString::new(c.kind.description()).expect("static cleanup label has no NUL"))
             .collect(),
         tree,
+        root,
+        scanned_at,
     }
+}
+
+fn path_arg(path: *const c_char) -> PathBuf {
+    let path = unsafe { CStr::from_ptr(path) };
+    PathBuf::from(String::from_utf8_lossy(path.to_bytes()).into_owned())
 }
 
 /// Start a scan on background threads. Returns a handle immediately.
 #[no_mangle]
 pub extern "C" fn bz_scan_start(path: *const c_char) -> *mut BzScan {
-    let path = unsafe { CStr::from_ptr(path) };
-    let path = PathBuf::from(String::from_utf8_lossy(path.to_bytes()).into_owned());
+    let path = path_arg(path);
 
     let progress = Arc::new(Progress::default());
     let done = Arc::new(AtomicBool::new(false));
@@ -52,10 +62,11 @@ pub extern "C" fn bz_scan_start(path: *const c_char) -> *mut BzScan {
         let result = result.clone();
         std::thread::spawn(move || {
             unsafe { crate::set_thread_qos_user_interactive() };
+            let started = SystemTime::now();
             let t0 = std::time::Instant::now();
             let tree = scan(&path, &progress);
             let t1 = std::time::Instant::now();
-            let flat = with_cleanup(tree);
+            let flat = with_cleanup(tree, path, started);
             if std::env::var_os("BZ_TIMING").is_some() {
                 eprintln!(
                     "[bz] scan {:.3}s  cleanup {:.1}ms",
@@ -91,6 +102,78 @@ pub extern "C" fn bz_progress(
         *bytes = h.progress.bytes.load(Ordering::Relaxed);
         *done = h.done.load(Ordering::Acquire) as c_int;
     }
+}
+
+/// Load the saved scan of `root` from `cache_path`, on the calling thread.
+/// Returns a finished handle (read it as after a scan), or NULL when there is
+/// no usable cache: missing, unreadable, damaged, from another format
+/// version, or for another folder or volume.
+#[no_mangle]
+pub extern "C" fn bz_cache_load(cache_path: *const c_char, root: *const c_char) -> *mut BzScan {
+    let (cache_path, root) = (path_arg(cache_path), path_arg(root));
+    let t0 = std::time::Instant::now();
+    let (tree, scanned_at) = match cache::load(&cache_path, &root) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[bz] ignoring saved scan {}: {e}", cache_path.display());
+            }
+            return std::ptr::null_mut();
+        }
+    };
+    let t1 = std::time::Instant::now();
+    let flat = with_cleanup(tree, root, scanned_at);
+    if std::env::var_os("BZ_TIMING").is_some() {
+        eprintln!(
+            "[bz] cache load {:.3}s  cleanup {:.1}ms",
+            (t1 - t0).as_secs_f64(),
+            t1.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    Box::into_raw(Box::new(BzScan {
+        progress: Arc::new(Progress::default()),
+        done: Arc::new(AtomicBool::new(true)),
+        result: Arc::new(std::sync::Mutex::new(None)),
+        flat: Some(Box::new(flat)),
+    }))
+}
+
+/// Save the handle's tree to `cache_path` (see `cache::save`). Slow for big
+/// trees: call it off the main thread. Returns 0, or -1 after logging why.
+///
+/// # Safety
+/// `h` must be a live handle whose tree was taken, not freed concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn bz_cache_save(h: *mut BzScan, cache_path: *const c_char) -> c_int {
+    let h = unsafe { &*h };
+    let cache_path = path_arg(cache_path);
+    let Some(f) = h.flat.as_ref() else { return -1 };
+    let t0 = std::time::Instant::now();
+    match cache::save(&f.tree, &f.root, f.scanned_at, &cache_path) {
+        Ok(sizes) => {
+            if std::env::var_os("BZ_TIMING").is_some() {
+                eprintln!(
+                    "[bz] cache save {:.3}s  {} bytes",
+                    t0.elapsed().as_secs_f64(),
+                    sizes.file
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("[bz] couldn't save scan to {}: {e}", cache_path.display());
+            -1
+        }
+    }
+}
+
+/// When the handle's scan started, in seconds since 1970.
+#[no_mangle]
+pub extern "C" fn bz_scanned_at(h: *mut BzScan) -> f64 {
+    let h = unsafe { &*h };
+    h.flat.as_ref().map_or(0.0, |f| {
+        f.scanned_at.duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+    })
 }
 
 /// After done: materialize the flat tree in the handle. Returns node count.
@@ -218,7 +301,7 @@ mod tests {
                 progress: Arc::new(Progress::default()),
                 done: Arc::new(AtomicBool::new(true)),
                 result: Arc::new(std::sync::Mutex::new(None)),
-                flat: Some(Box::new(with_cleanup(tree))),
+                flat: Some(Box::new(with_cleanup(tree, "/root".into(), UNIX_EPOCH))),
             };
             let h = &mut handle as *mut BzScan;
             assert_eq!(unsafe { bz_cleanup_count(h) } as usize, expected.len());

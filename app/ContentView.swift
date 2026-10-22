@@ -286,6 +286,7 @@ private struct ScanStatusBar: View {
                     }
                     Text("\(Fmt.size(a)) · \(String(format: "%.1f%%", 100 * Double(a) / Double(rootA)))")
                         .monospacedDigit()
+                    if tree.isSaved { savedNote(tree) }
                 } else {
                     Text("\(Fmt.num(UInt64(tree.nFiles[model.viewRoot]))) files · \(Fmt.size(tree.size[model.viewRoot]))")
                     let cloned = tree.cloned(model.viewRoot)
@@ -315,9 +316,13 @@ private struct ScanStatusBar: View {
                             .buttonStyle(.borderless)
                         }
                     }
-                    Text("scanned in \(String(format: "%.1fs", model.elapsed))")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+                    if tree.isSaved {
+                        savedNote(tree)
+                    } else {
+                        Text("scanned in \(String(format: "%.1fs", model.elapsed))")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
                 }
             } else {
                 Text("BlitzTree").foregroundStyle(.tertiary)
@@ -327,6 +332,14 @@ private struct ScanStatusBar: View {
         .font(.callout)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    /// The last launch's results are on screen while a fresh scan runs.
+    private func savedNote(_ tree: Tree) -> some View {
+        let age = RelativeDateTimeFormatter().localizedString(for: tree.scannedAt, relativeTo: Date())
+        return Text("Results from \(age) · refreshing…")
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 }
 
@@ -515,6 +528,15 @@ struct OutlinePanel: NSViewRepresentable {
                     && zip(roots, childIDs).allSatisfy { item, id in
                         item.canRebind(to: Int(id), in: t) && outline?.isItemExpanded(item) == false
                     }
+                // Rows open in the saved results stay open in the fresh scan.
+                var reopen: [[[UInt8]]] = []
+                if let old = tree, old.isSaved, !t.isSaved, let outline, outline.numberOfRows <= 20_000 {
+                    for row in 0..<outline.numberOfRows {
+                        if let it = outline.item(atRow: row) as? Item, outline.isItemExpanded(it) {
+                            reopen.append(old.namePath(it.id))
+                        }
+                    }
+                }
                 tree = t
                 viewRoot = model.viewRoot
                 let started = Date()
@@ -534,6 +556,10 @@ struct OutlinePanel: NSViewRepresentable {
                 } else {
                     roots = childIDs.map { Item(id: Int($0), tree: t) }
                     outline?.reloadData()
+                    // In row order, so each folder opens after its parent.
+                    for names in reopen {
+                        if let node = t.node(at: names), let it = item(for: node) { outline?.expandItem(it) }
+                    }
                 }
                 if ProcessInfo.processInfo.environment["BZ_TIMING"] != nil {
                     NSLog("BZ list reload: %.1f ms", -started.timeIntervalSinceNow * 1000)
@@ -651,13 +677,24 @@ struct OutlinePanel: NSViewRepresentable {
 
         /// Treemap click → expand ancestors, select and reveal the row here.
         func syncSelection() {
-            guard let outline, let tree, let sel = model?.selection else { return }
+            guard let outline, let sel = model?.selection else { return }
             if let cur = outline.item(atRow: outline.selectedRow) as? Item, cur.id == sel { return }
+            if let target = item(for: sel) {
+                let row = outline.row(forItem: target)
+                if row >= 0 {
+                    outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                    outline.scrollRowToVisible(row)
+                }
+            }
+        }
 
+        /// The row for `node`, its ancestors expanded. Nil outside the view root.
+        private func item(for node: Int) -> Item? {
+            guard let outline, let tree else { return nil }
             var chain: [Int] = []
-            var cur = sel
+            var cur = node
             while cur != viewRoot {
-                if cur == Int(UInt32.max) { return } // outside current view root
+                if cur == Int(UInt32.max) { return nil } // outside current view root
                 chain.append(cur)
                 cur = Int(tree.parents[cur])
             }
@@ -666,20 +703,14 @@ struct OutlinePanel: NSViewRepresentable {
             var level = roots
             var target: Item?
             for id in chain {
-                guard let it = level.first(where: { $0.id == id }) else { return }
+                guard let it = level.first(where: { $0.id == id }) else { return nil }
                 target = it
                 if id != chain.last {
                     outline.expandItem(it)
                     level = it.children
                 }
             }
-            if let target {
-                let row = outline.row(forItem: target)
-                if row >= 0 {
-                    outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-                    outline.scrollRowToVisible(row)
-                }
-            }
+            return target
         }
 
         @objc func doubleClicked(_ sender: NSOutlineView) {

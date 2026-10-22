@@ -6,6 +6,7 @@
 - Clean Up and AI cleanup sizes count only blocks no other file shares. Blocks shared with an APFS clone don't count as freed, because a clone elsewhere, even one changed since, can keep them on disk.
 - JSON CLI: entries and the summary add `unique_bytes` and `cloned_bytes`. `allocated_bytes` keeps its meaning. Clean Up candidates are now selected and sorted by unique bytes.
 - Scans read each file's clone id and sharing flags, which makes them about 10% slower. Asking for each file's private size as well made scans 3x slower, so BlitzTree asks for it only for Clean Up candidates.
+- Launch shows the last results right away. After each scan, BlitzTree saves the results, compressed, to `~/Library/Caches/dev.ahmed.blitztree`. The next scan of the same folder shows them within a second or two, with "Results from 2 hours ago · refreshing…" in the status bar, while a fresh scan runs. The fresh results then replace them, keeping the folder on screen, the selection and open rows. Until then, Clean Up's Move to Trash and "Clean up with Claude Code" wait for the fresh scan; Move to Trash from the right-click menu still works. Saved results from another version of BlitzTree, another disk, or a damaged file are ignored.
 
 ## 0.5.6 — 2026-09-27
 

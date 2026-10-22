@@ -4,6 +4,7 @@
 //! metadata (name, type, sizes) per syscall, so we never pay the classic
 //! readdir-then-stat-per-file cost that makes naive scanners slow on macOS.
 
+pub mod cache;
 pub mod cleanup;
 pub mod ffi;
 pub mod searchfs;
@@ -695,6 +696,14 @@ fn count_clones_once(t: &mut Tree, mut clones: Vec<(CloneInfo, u32)>) {
 /// Derive subtree totals and the sorted child lists from the walk's arrays.
 fn finish(t: &mut Tree, clones: Vec<(CloneInfo, u32)>) {
     count_clones_once(t, clones);
+    total_and_link(t);
+}
+
+/// Folder totals (alloc, unique, logical, n_files, complete) from each
+/// file's own values, then the child lists. Folders' own sizes must be zero.
+/// Every node's parent must come before it, and each folder's children must
+/// be one contiguous run.
+fn total_and_link(t: &mut Tree) {
     let runs = runs(&t.parents);
     // Bottom-up: a directory's run starts after its parent's run, so reverse
     // run order finishes every child before its parent.

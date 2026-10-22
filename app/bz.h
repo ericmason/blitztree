@@ -34,6 +34,17 @@ const char *bz_cleanup_description(BzScan *h, uint64_t index);
 // files' attributes, so prefer calling it off the main thread.
 void bz_reclaimable(BzScan *h, const uint32_t *nodes, uint64_t count, uint64_t *out);
 
+// The last finished scan of a folder, saved to disk. bz_cache_load returns a
+// finished handle (call bz_take_tree as after a scan), or NULL when there is
+// no usable file: missing, damaged, another format version, or another
+// folder or volume. Both are slow on big trees; call them off the main thread.
+BzScan *bz_cache_load(const char *cache_path, const char *root);
+// Needs the tree taken. Writes a temporary file, then renames it into
+// place. Returns 0, or -1 after logging why.
+int bz_cache_save(BzScan *h, const char *cache_path);
+// When the handle's scan started, in seconds since 1970.
+double bz_scanned_at(BzScan *h);
+
 void bz_free(BzScan *h);
 
 #endif

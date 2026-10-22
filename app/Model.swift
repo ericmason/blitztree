@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import SwiftUI
 import Foundation
 import Observation
@@ -24,8 +25,12 @@ nonisolated final class Tree: @unchecked Sendable {
     let cleanupCount: Int
     let cleanupNodes: UnsafePointer<UInt32>
     let errors: UInt64
+    /// When the scan started.
+    let scannedAt: Date
+    /// Loaded from the last launch's saved scan, not scanned just now.
+    let isSaved: Bool
 
-    init?(handle: OpaquePointer) {
+    init?(handle: OpaquePointer, saved: Bool = false) {
         let n = bz_take_tree(handle)
         guard n > 0,
               let parents = bz_parents(handle),
@@ -55,9 +60,41 @@ nonisolated final class Tree: @unchecked Sendable {
         self.cleanupCount = Int(bz_cleanup_count(handle))
         self.cleanupNodes = cleanupNodes
         self.errors = bz_errors(handle)
+        self.scannedAt = Date(timeIntervalSince1970: bz_scanned_at(handle))
+        self.isSaved = saved
     }
 
     deinit { bz_free(handle) }
+
+    /// Save this scan for the next launch. Slow on big trees: call it off
+    /// the main thread.
+    func save(to file: String) -> Bool { bz_cache_save(handle, file) == 0 }
+
+    /// Names from the root down to `i`, to find the same file in another scan.
+    func namePath(_ i: Int) -> [[UInt8]] {
+        ancestry(i).dropFirst().map { node in
+            let start = Int(nameOff[node])
+            return Array(UnsafeBufferPointer(start: nameBlob + start, count: Int(nameOff[node + 1]) - start))
+        }
+    }
+
+    /// The node at `names` (see `namePath`), if this scan has it.
+    func node(at names: [[UInt8]]) -> Int? {
+        var cur = 0
+        for name in names {
+            // Compared in place: big folders have 100k siblings.
+            let match = name.withUnsafeBytes { want in
+                children(cur).first { child in
+                    let start = Int(nameOff[Int(child)])
+                    return Int(nameOff[Int(child) + 1]) - start == want.count
+                        && (want.isEmpty || memcmp(nameBlob + start, want.baseAddress!, want.count) == 0)
+                }
+            }
+            guard let match else { return nil }
+            cur = Int(match)
+        }
+        return cur
+    }
 
     func isDir(_ i: Int) -> Bool { flags[i] & 1 != 0 }
 
@@ -286,11 +323,19 @@ final class ScanModel {
         didSet { UserDefaults.standard.set(mapStyle.rawValue, forKey: "bz.mapStyle") }
     }
 
+    /// The tree on screen is the last launch's saved scan, shown while the
+    /// fresh scan runs. Its node IDs and sizes may be out of date, so actions
+    /// that delete by node wait for the fresh scan.
+    var showingSaved: Bool { tree?.isSaved == true }
+
     private var handle: OpaquePointer?
     private var timer: Timer?
     private var startedAt: Date?
     private var activity: NSObjectProtocol?
     private var volumeTask: Task<VolumeSpace, Never>?
+    /// Bumped per scan, so a saved scan that loads late is never shown over
+    /// a newer one.
+    private var scanNumber = 0
 
     func startScan(path: String? = nil) {
         if scanning || cleanupTrash.running { return }
@@ -304,6 +349,8 @@ final class ScanModel {
         lastPollAt = nil; maxPollGap = 0
         scanning = true
         startedAt = Date()
+        scanNumber += 1
+        showSavedScan(of: scanRoot, scan: scanNumber)
         // Keep the process out of App Nap / timer coalescing while scanning.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .latencyCritical],
@@ -329,6 +376,26 @@ final class ScanModel {
 
     private var lastPollAt: Date?
     private var maxPollGap: Double = 0
+
+    /// Load the last saved scan of `root` alongside the real scan and show it
+    /// until that one finishes. A missing or unusable file is skipped.
+    private func showSavedScan(of root: String, scan: Int) {
+        let file = ScanCache.file(for: root)
+        Task {
+            let saved = await Task.detached(priority: .userInitiated) { () -> Tree? in
+                guard let h = bz_cache_load(file, root) else { return nil }
+                let saved = Tree(handle: h, saved: true)
+                if saved == nil { bz_free(h) }
+                return saved
+            }.value
+            guard let saved, scan == scanNumber, scanning, tree == nil else { return }
+            tree = saved
+            hasShownTree = true
+            let found = await Task.detached(priority: .userInitiated) { Cleanup.find(in: saved) }.value
+            guard self.tree === saved else { return }
+            cleanup = found
+        }
+    }
 
     private func poll() {
         guard let handle else {
@@ -361,8 +428,26 @@ final class ScanModel {
     private func finishScan(_ result: Tree?, space: VolumeSpace, doneAt: Date) {
         timer?.invalidate()
         timer = nil
-        tree = result
+        if let saved = tree, saved.isSaved, let result {
+            // Keep the folder on screen and the selection, found by path.
+            let root = result.node(at: saved.namePath(viewRoot)) ?? 0
+            let picked = selection.flatMap { result.node(at: saved.namePath($0)) }
+            selection = nil
+            hovered = nil
+            cleanup = []
+            tree = result
+            viewRoot = root
+            if let picked, result.ancestry(picked).contains(root) { selection = picked }
+        } else {
+            tree = result
+        }
         if tree != nil { hasShownTree = true }
+        if let result {
+            let file = ScanCache.file(for: scanRoot)
+            Task.detached(priority: .utility) {
+                if !result.save(to: file) { NSLog("BZ couldn't save the scan to %@", file) }
+            }
+        }
         if ProcessInfo.processInfo.environment["BZ_TIMING"] != nil {
             // Queue latency includes awaiting metadata and UI updates; it is
             // not a measurement of uninterrupted main-thread blocking.
@@ -396,6 +481,20 @@ final class ScanModel {
         }
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
         activity = nil
+    }
+}
+
+/// Where each scanned folder's last finished scan is saved.
+nonisolated enum ScanCache {
+    /// ~/Library/Caches/<bundle id>/scan-<hash of the root>.bzcache.
+    /// BZ_CACHE_DIR overrides the folder (QA and benchmarks).
+    static func file(for root: String) -> String {
+        let dir = ProcessInfo.processInfo.environment["BZ_CACHE_DIR"] ?? {
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "dev.ahmed.blitztree").path
+        }()
+        let hash = SHA256.hash(data: Data(root.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(dir)/scan-\(hash).bzcache"
     }
 }
 
