@@ -30,7 +30,7 @@ struct UIHandoff {
                 if definition.identifier.rawValue == "name" {
                     precondition(cell.textField?.stringValue == item.tree.name(item.id), "Stale displayed name")
                 } else if definition.identifier.rawValue == "size" {
-                    precondition(cell.textField?.stringValue == Fmt.size(item.tree.alloc[item.id]), "Stale displayed size")
+                    precondition(cell.textField?.stringValue == Fmt.size(item.tree.size[item.id]), "Stale displayed size")
                 }
                 checked += 1
             }
