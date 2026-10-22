@@ -62,8 +62,8 @@ void bz_fixture_add_cleanup(BzScan *h, uint32_t node, const char *description) {
 }
 uint64_t bz_cleanup_count(BzScan *h) { return h->cleanup_count; }
 const uint32_t *bz_cleanup_nodes(BzScan *h) { return h->cleanup_nodes; }
-void bz_cleanup_reclaimable(BzScan *h, uint64_t *out) {
-    for (uint32_t i = 0; i < h->cleanup_count; ++i) out[i] = h->alloc[h->cleanup_nodes[i]];
+void bz_reclaimable(BzScan *h, const uint32_t *nodes, uint64_t count, uint64_t *out) {
+    for (uint64_t i = 0; i < count; ++i) out[i] = h->alloc[nodes[i]];
 }
 const char *bz_cleanup_description(BzScan *h, uint64_t index) {
     return index < h->cleanup_count ? h->cleanup_descriptions[index] : NULL;

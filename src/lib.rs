@@ -64,7 +64,6 @@ const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
 const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
 const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100;
 const ATTR_CMNEXT_EXT_FLAGS: u32 = 0x0000_0200;
-const ATTR_CMNEXT_CLONE_REFCNT: u32 = 0x0000_1000;
 /// sys/stat.h: the file may share blocks with another file (an APFS clone).
 const EF_MAY_SHARE_BLOCKS: u64 = 0x0000_0001;
 /// sys/stat.h: the file shares all of its blocks with another file.
@@ -163,10 +162,13 @@ impl Tree {
         self.alloc[i] - self.unique[i]
     }
     /// What deleting each of `roots` (disjoint subtrees) would free, as far as
-    /// APFS clones go: its unique size, less the blocks that stay on disk for
-    /// a clone outside it. Asks the file system for clone counts and private
-    /// sizes of the files involved, so call it off the main thread. Unknown
-    /// answers count as not freed. Hard links and snapshots are not considered.
+    /// APFS clones go: for files that share blocks with a clone, only their
+    /// private size counts. Shared blocks never count as freed, even when every
+    /// clone the scan found is inside, because a clone that has since been
+    /// changed (outside the scan or not) can still hold them and APFS doesn't
+    /// say which file it is. Asks the file system for private sizes, so call it
+    /// off the main thread; an unknown private size counts as not freed. Hard
+    /// links and snapshots are not considered.
     pub fn reclaimable(&self, roots: &[u32]) -> Vec<u64> {
         let mut out: Vec<u64> = roots.iter().map(|&r| self.unique[r as usize]).collect();
         let slot: HashMap<u32, usize> = roots.iter().enumerate().map(|(k, &r)| (r, k)).collect();
@@ -179,22 +181,19 @@ impl Tree {
             }
             i = self.parents[i as usize];
         };
+        // Full clones have no private blocks: take the shared bytes back off
+        // the member that counted them.
         let mut start = 0;
         for g in &self.clone_groups {
-            let members = &self.clone_members[start as usize..g.end as usize];
+            let owner = self.clone_members[start as usize];
             start = g.end;
-            let Some(k) = inside(members[0]) else { continue };
-            // The clone count covers members outside the scan too.
-            let whole = members[1..].iter().all(|&m| inside(m) == Some(k))
-                && extended_attr(&self.path(members[0] as usize), ATTR_CMNEXT_CLONE_REFCNT)
-                    .is_some_and(|n| n <= members.len() as u64);
-            if !whole {
+            if let Some(k) = inside(owner) {
                 out[k] -= g.shared.min(out[k]);
             }
         }
         for &i in &self.partial_clones {
             let Some(k) = inside(i) else { continue };
-            let private = extended_attr(&self.path(i as usize), ATTR_CMNEXT_PRIVATESIZE).unwrap_or(0);
+            let private = private_size(&self.path(i as usize)).unwrap_or(0);
             out[k] -= self.unique[i as usize].saturating_sub(private).min(out[k]);
         }
         out
@@ -251,8 +250,10 @@ struct CloneInfo {
     shares_all: bool,
 }
 
-/// One extended common attribute of `path`, read with getattrlist(2).
-fn extended_attr(path: &Path, attr: u32) -> Option<u64> {
+/// The bytes of `path` no other file shares (ATTR_CMNEXT_PRIVATESIZE), read
+/// with getattrlist(2).
+fn private_size(path: &Path) -> Option<u64> {
+    let attr = ATTR_CMNEXT_PRIVATESIZE;
     let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut attrlist = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -271,8 +272,8 @@ fn extended_attr(path: &Path, attr: u32) -> Option<u64> {
     if status != 0 || u32_at(&buf, 4 + 16) & attr == 0 {
         return None;
     }
-    // CLONE_REFCNT is a u_int32_t; the others used here are 64-bit.
-    Some(if attr == ATTR_CMNEXT_CLONE_REFCNT { u32_at(&buf, 24) as u64 } else { u64_at(&buf, 24) })
+    // An off_t, after the length and the returned attribute set.
+    Some(i64_at(&buf, 24).max(0) as u64)
 }
 
 impl Entry {
@@ -1221,20 +1222,22 @@ mod tests {
         const COPY: u64 = 4 << 20;
         let root = std::env::temp_dir().join(format!("bz-test-clones-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in ["clones", "plain", "changed"] {
+        for dir in ["family/clones", "plain", "changed"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        std::fs::write(root.join("original"), vec![7u8; COPY as usize]).unwrap();
+        let original = root.join("family/original");
+        std::fs::write(&original, vec![7u8; COPY as usize]).unwrap();
         std::fs::write(root.join("plain/file"), vec![9u8; 100_000]).unwrap();
-        if !clonefile(&root.join("original"), &root.join("clones/a"))
-            || !clonefile(&root.join("original"), &root.join("clones/b"))
-            || !clonefile(&root.join("original"), &root.join("changed/c"))
+        if !clonefile(&original, &root.join("family/clones/a"))
+            || !clonefile(&original, &root.join("family/clones/b"))
+            || !clonefile(&original, &root.join("changed/c"))
         {
             let _ = std::fs::remove_dir_all(&root);
             eprintln!("skipped: temp dir is not on APFS ({})", std::io::Error::last_os_error());
             return;
         }
-        // Rewriting part of a clone gives it a clone id of its own.
+        // Rewriting part of a clone gives it a clone id of its own, and APFS
+        // stops counting it as a clone, but it still shares the other blocks.
         {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new().write(true).open(root.join("changed/c")).unwrap();
@@ -1243,12 +1246,14 @@ mod tests {
         }
 
         let t = scan(&root, &Progress::default());
-        let partial = scan(&root.join("clones"), &Progress::default());
+        let alone = scan(&root.join("family"), &Progress::default());
+        let clones_alone = scan(&root.join("family/clones"), &Progress::default());
         let find = |n: &str| (0..t.len()).find(|&i| t.name(i) == n).unwrap();
-        let (clones, plain, changed) = (find("clones"), find("plain"), find("changed"));
+        let (family, clones, plain, changed) = (find("family"), find("clones"), find("plain"), find("changed"));
         let reclaim = t.reclaimable(&[0]);
-        let reclaim_parts = t.reclaimable(&[clones as u32, changed as u32]);
-        let reclaim_partial = partial.reclaimable(&[0]);
+        let reclaim_parts = t.reclaimable(&[family as u32, changed as u32, plain as u32]);
+        let reclaim_alone = alone.reclaimable(&[0]);
+        let reclaim_clones_alone = clones_alone.reclaimable(&[0]);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(t.errors, 0);
         let near = |a: u64, b: u64| a.abs_diff(b) <= 64 << 10;
@@ -1259,11 +1264,9 @@ mod tests {
         assert_eq!(t.cloned(plain), 0);
 
         // The original and the two untouched clones count as one copy.
-        let family = t.alloc[0] - t.alloc[plain] - t.alloc[changed];
-        assert!(near(family, 3 * COPY), "allocated size counts every clone: {family}");
-        let unique = t.unique[0] - t.unique[plain] - t.unique[changed];
-        assert!(near(unique, COPY), "the folder holds one copy: {unique}");
-        assert!(near(t.cloned(0), 2 * COPY), "two copies are cloned bytes: {}", t.cloned(0));
+        assert!(near(t.alloc[family], 3 * COPY), "allocated size counts every clone: {}", t.alloc[family]);
+        assert!(near(t.unique[family], COPY), "the folder holds one copy: {}", t.unique[family]);
+        assert!(near(t.cloned(family), 2 * COPY), "two copies are cloned bytes: {}", t.cloned(family));
         // The original has the lowest file id, so it holds the shared bytes.
         assert!(near(t.unique[find("original")], COPY));
         assert_eq!(t.unique[clones], 0);
@@ -1272,18 +1275,24 @@ mod tests {
         assert_eq!(t.unique[changed], t.alloc[changed]);
         assert_eq!(t.partial_clones, [find("c") as u32]);
 
-        // Deleting the clones frees nothing; deleting the changed clone frees
-        // only what was rewritten. Its other blocks never count as freed, even
-        // with the whole family deleted, since its partner is unknown.
-        assert!(near(reclaim[0], t.unique[0] - COPY + 65536), "{reclaim:?}");
+        // Only private blocks count as freed. Deleting the family frees
+        // nothing: the changed clone outside it still holds the shared blocks.
+        // Deleting the changed clone frees what was rewritten. Shared blocks
+        // never count, even with everything deleted.
         assert_eq!(reclaim_parts[0], 0);
         assert!(near(reclaim_parts[1], 65536), "{}", reclaim_parts[1]);
+        assert_eq!(reclaim_parts[2], t.unique[plain]);
+        assert!(near(reclaim[0], t.unique[plain] + 65536), "{reclaim:?}");
 
-        // Scanning only the clones: they count once, but deleting them frees
-        // nothing because the original is outside the scan.
-        assert!(near(partial.unique[0], COPY), "{}", partial.unique[0]);
-        assert!(near(partial.cloned(0), COPY));
-        assert_eq!(reclaim_partial, [0]);
+        // Scanning only the family: it counts once and still frees nothing,
+        // though every clone the scan sees is inside it.
+        assert!(near(alone.unique[0], COPY), "{}", alone.unique[0]);
+        assert!(near(alone.cloned(0), 2 * COPY));
+        assert_eq!(reclaim_alone, [0]);
+        // Scanning only the clones, without the original.
+        assert!(near(clones_alone.unique[0], COPY), "{}", clones_alone.unique[0]);
+        assert!(near(clones_alone.cloned(0), COPY));
+        assert_eq!(reclaim_clones_alone, [0]);
     }
 
     #[test]
@@ -1310,8 +1319,8 @@ mod tests {
             assert_eq!(t.clone_members, [3, 4, 2]);
             assert_eq!(t.clone_groups, [CloneGroup { end: 3, shared: 8192 }]);
             assert_eq!(t.partial_clones, [5]);
-            // With no files on disk, neither the clone count nor the changed
-            // file's private size is known, so nothing counts as freed.
+            // Full clones free nothing, and with no files on disk the changed
+            // file's private size is unknown, so nothing counts as freed.
             assert_eq!(t.reclaimable(&[1]), [0]);
             assert_eq!(t.reclaimable(&[3, 4]), [0, 0]);
         }

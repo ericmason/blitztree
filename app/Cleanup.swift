@@ -9,8 +9,8 @@ nonisolated struct CleanupItem: Identifiable, Sendable {
     let path: String
     let display: String
     let kind: String
-    /// What deleting it frees: APFS clones shared with files outside it
-    /// don't count, since their blocks stay on disk.
+    /// What deleting it frees: blocks shared with APFS clones don't count,
+    /// since a clone elsewhere can keep them on disk.
     let bytes: UInt64
     var id: Int { node }
 }
@@ -20,7 +20,7 @@ nonisolated enum Cleanup {
     /// Swift only supplies presentation paths; rules and labels live in cleanup.rs.
     static func find(in tree: Tree) -> [CleanupItem] {
         let home = NSHomeDirectory()
-        let freed = tree.cleanupReclaimable()
+        let freed = tree.reclaimable(Array(UnsafeBufferPointer(start: tree.cleanupNodes, count: tree.cleanupCount)))
         return (0..<tree.cleanupCount).map { index in
             let node = Int(tree.cleanupNodes[index])
             let path = tree.path(node)

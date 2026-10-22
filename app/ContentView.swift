@@ -422,8 +422,12 @@ final class NameCell: NSTableCellView {
             // too little is (the tooltip and status bar repeat it).
             let nameWidth = ceil(textField?.attributedStringValue.size().width ?? 0) + 4
             let left = bounds.width - 25 - nameWidth - 6
-            noteWidth = left < 40 ? 0 : min(ceil(noteField.intrinsicContentSize.width), left)
-            noteField.isHidden = noteWidth == 0
+            // Too narrow for the figure: just "cloned" (or nothing).
+            let width = { (s: String) in ceil((s as NSString).size(withAttributes: [.font: Self.noteFont]).width) + 4 }
+            let fits = [note, "cloned"].compactMap { $0 }.first { width($0) <= left }
+            noteField.stringValue = fits ?? ""
+            noteWidth = fits.map(width) ?? 0
+            noteField.isHidden = fits == nil
             noteField.frame = NSRect(x: bounds.width - 2 - noteWidth, y: ((h - Self.noteLineHeight) / 2).rounded(),
                                      width: noteWidth, height: Self.noteLineHeight)
             if noteWidth > 0 { noteWidth += 6 }

@@ -503,7 +503,8 @@ final class PlanItem: Identifiable {
     var trashed: [URL] = []
     var trashedBytes: UInt64 = 0
 
-    /// Size from the scan where it can be measured, else the agent's figure.
+    /// What deleting it frees by the scan (blocks shared with APFS clones
+    /// don't count) when the scan saw its paths, else the agent's figure.
     let bytes: UInt64
     /// Its folders in the scan the plan was made from, for the treemap.
     let nodes: [Int]
@@ -578,9 +579,12 @@ final class PlanItem: Identifiable {
         // Measured sizes, not counting a path inside another listed one twice.
         let nodes = Set(paths.compactMap { tree.node(at: $0) })
         let outer = nodes.filter { node in !tree.ancestry(node).dropLast().contains(where: nodes.contains) }
-        let measured = outer.reduce(UInt64(0)) { $0 + tree.size[$1] }
+        // A scanned path's figure stands even when it is zero (clones whose
+        // blocks another file keeps); the agent's guess is only for paths
+        // the scan never saw.
         self.nodes = Array(outer)
-        bytes = measured > 0 ? measured : UInt64(max(0, spec.bytes))
+        bytes = outer.isEmpty ? UInt64(max(0, spec.bytes))
+            : tree.reclaimable(outer.map { UInt32($0) }).reduce(0, +)
     }
 
     var isCommand: Bool { spec.action == "command" && !viaTrash }

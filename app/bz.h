@@ -28,9 +28,11 @@ uint64_t bz_cleanup_count(BzScan *h);
 const uint32_t *bz_cleanup_nodes(BzScan *h);
 // index is a candidate-list index, not a tree node index. NULL out of range.
 const char *bz_cleanup_description(BzScan *h, uint64_t index);
-// Writes cleanup_count values: what deleting each candidate frees, counting
-// APFS clones conservatively. Reads files' attributes: call off the main thread.
-void bz_cleanup_reclaimable(BzScan *h, uint64_t *out);
+
+// Writes count values: what deleting each node frees. Blocks shared with APFS
+// clones don't count. Nodes must not contain one another. Reads partly cloned
+// files' attributes, so prefer calling it off the main thread.
+void bz_reclaimable(BzScan *h, const uint32_t *nodes, uint64_t count, uint64_t *out);
 
 void bz_free(BzScan *h);
 

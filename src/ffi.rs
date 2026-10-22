@@ -147,18 +147,27 @@ pub unsafe extern "C" fn bz_cleanup_nodes(h: *mut BzScan) -> *const u32 {
         .map_or(std::ptr::null(), |f| f.cleanup_nodes.as_ptr())
 }
 
-/// Write what deleting each Clean Up candidate would free (see
-/// `Tree::reclaimable`) to `out`. This asks the file system about cloned
-/// files, so call it off the main thread; it only reads the tree.
+/// Write what deleting each of `count` nodes would free (see
+/// `Tree::reclaimable`) to `out`. The nodes must not contain one another.
+/// This asks the file system about partly cloned files, so prefer calling
+/// it off the main thread; it only reads the tree.
 ///
 /// # Safety
 /// `h` must be a live scan handle, with no concurrent mutation or free.
-/// `out` must have room for `bz_cleanup_count(h)` elements.
+/// `nodes` and `out` must each have room for `count` elements, and every
+/// Out-of-range nodes leave `out` untouched.
 #[no_mangle]
-pub unsafe extern "C" fn bz_cleanup_reclaimable(h: *mut BzScan, out: *mut u64) {
+pub unsafe extern "C" fn bz_reclaimable(h: *mut BzScan, nodes: *const u32, count: u64, out: *mut u64) {
     let h = unsafe { &*h };
-    if let Some(f) = h.flat.as_ref().filter(|f| !f.cleanup_nodes.is_empty() && !out.is_null()) {
-        let freed = f.tree.reclaimable(&f.cleanup_nodes);
+    if count == 0 || nodes.is_null() || out.is_null() {
+        return;
+    }
+    if let Some(f) = h.flat.as_ref() {
+        let nodes = unsafe { std::slice::from_raw_parts(nodes, count as usize) };
+        if nodes.iter().any(|&n| n as usize >= f.tree.len()) {
+            return;
+        }
+        let freed = f.tree.reclaimable(nodes);
         unsafe { std::ptr::copy_nonoverlapping(freed.as_ptr(), out, freed.len()) };
     }
 }
@@ -215,7 +224,7 @@ mod tests {
             assert_eq!(unsafe { bz_cleanup_count(h) } as usize, expected.len());
             let nodes = unsafe { std::slice::from_raw_parts(bz_cleanup_nodes(h), expected.len()) };
             let mut freed = vec![0u64; expected.len()];
-            unsafe { bz_cleanup_reclaimable(h, freed.as_mut_ptr()) };
+            unsafe { bz_reclaimable(h, nodes.as_ptr(), nodes.len() as u64, freed.as_mut_ptr()) };
             for (i, candidate) in expected.iter().enumerate() {
                 assert_eq!(nodes[i], candidate.node);
                 assert_eq!(freed[i], unsafe { *bz_unique(h).add(candidate.node as usize) });

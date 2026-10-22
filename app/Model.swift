@@ -64,21 +64,25 @@ nonisolated final class Tree: @unchecked Sendable {
     /// Bytes shared with APFS clones and counted elsewhere.
     func cloned(_ i: Int) -> UInt64 { allocated[i] - size[i] }
 
-    /// "+918 GB cloned", or "2.26 GB · clone" for a clone counted elsewhere
-    /// in full. Nil when the cloned bytes are under a tenth of the node's
-    /// allocated size or under 1 MB.
+    /// "+918 GB cloned", or "2.26 GB cloned" for a clone counted elsewhere
+    /// in full (its size is zero). Nil when the cloned bytes are under a
+    /// tenth of the node's allocated size or under 1 MB.
     func cloneNote(_ i: Int) -> String? {
         let c = cloned(i)
         guard c >= 1_000_000, c >= allocated[i] / 10 else { return nil }
-        return size[i] == 0 ? "\(Fmt.size(c)) · clone" : "+\(Fmt.size(c)) cloned"
+        return size[i] == 0 ? "\(Fmt.size(c)) cloned" : "+\(Fmt.size(c)) cloned"
     }
 
-    /// What deleting each Clean Up candidate frees. Asks the file system
-    /// about cloned files, so call it off the main thread.
-    func cleanupReclaimable() -> [UInt64] {
-        guard cleanupCount > 0 else { return [] }
-        var out = [UInt64](repeating: 0, count: cleanupCount)
-        out.withUnsafeMutableBufferPointer { bz_cleanup_reclaimable(handle, $0.baseAddress) }
+    /// What deleting each node frees; blocks shared with APFS clones don't
+    /// count. The nodes must not contain one another.
+    func reclaimable(_ nodes: [UInt32]) -> [UInt64] {
+        guard !nodes.isEmpty else { return [] }
+        var out = [UInt64](repeating: 0, count: nodes.count)
+        nodes.withUnsafeBufferPointer { ids in
+            out.withUnsafeMutableBufferPointer {
+                bz_reclaimable(handle, ids.baseAddress, UInt64(ids.count), $0.baseAddress)
+            }
+        }
         return out
     }
 
