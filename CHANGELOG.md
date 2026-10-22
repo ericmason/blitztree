@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Right-click a file or folder in the list for the same menu as the treemap: Reveal in Finder, Copy Path, and Move to Trash.
+
 ## 0.5.6 — 2026-09-27
 
 - BlitzTree updates itself. It checks GitHub for a new release once a day, downloads it in the background and installs it when you quit. Check for Updates… is in the BlitzTree menu. Updates are signed, and Full Disk Access carries over.

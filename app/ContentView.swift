@@ -642,10 +642,20 @@ struct OutlinePanel: NSViewRepresentable {
         }
     }
 
+    /// Right-click shows the same menu as the treemap and rings.
+    final class Outline: NSOutlineView {
+        override func rightMouseDown(with event: NSEvent) {
+            let row = self.row(at: convert(event.locationInWindow, from: nil))
+            guard row >= 0, let it = item(atRow: row) as? Item else { return }
+            selectRowIndexes([row], byExtendingSelection: false)
+            NodeMenu.popUp(path: it.tree.path(it.id), with: event, for: self)
+        }
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let outline = NSOutlineView()
+        let outline = Outline()
         outline.style = .plain
         outline.rowSizeStyle = .default
         outline.usesAlternatingRowBackgroundColors = true
