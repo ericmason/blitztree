@@ -339,12 +339,19 @@ private struct ScanStatusBar: View {
         let age = RelativeDateTimeFormatter().localizedString(for: tree.scannedAt, relativeTo: Date())
         // Above the other status text: when the bar runs out of room, this
         // is the line that must stay readable.
-        return HStack(spacing: 6) {
-            ProgressView().controlSize(.small)
-            Text("Results from \(age) · refreshing…")
+        // The saved file count is the best guess at how many the fresh scan
+        // will find, so it drives the bar.
+        let expected = max(Double(tree.nFiles[0]), 1)
+        let done = min(Double(model.files) / expected, 1)
+        return HStack(spacing: 8) {
+            Text("Results from \(age) · refreshing \(Int(done * 100))%")
                 .foregroundStyle(.secondary)
+                .monospacedDigit()
                 .lineLimit(1)
                 .fixedSize()
+            ProgressView(value: done)
+                .progressViewStyle(.linear)
+                .frame(width: 120)
         }
         .layoutPriority(1)
     }
