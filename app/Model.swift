@@ -408,6 +408,10 @@ final class ScanModel {
     /// compete for every core and the saved scan took 5x longer to appear.
     /// A missing or unusable file is skipped.
     private func showSavedScan(of root: String, scan: Int) {
+        guard ScanCache.enabled else {
+            handle = bz_scan_start(root)
+            return
+        }
         let file = ScanCache.file(for: root)
         loadingSaved = FileManager.default.fileExists(atPath: file)
         Task {
@@ -473,7 +477,7 @@ final class ScanModel {
             tree = result
         }
         if tree != nil { hasShownTree = true }
-        if let result {
+        if let result, ScanCache.enabled {
             let file = ScanCache.file(for: scanRoot)
             Task.detached(priority: .utility) {
                 if !result.save(to: file) { NSLog("BZ couldn't save the scan to %@", file) }
@@ -520,12 +524,36 @@ nonisolated enum ScanCache {
     /// ~/Library/Caches/<bundle id>/scan-<hash of the root>.bzcache.
     /// BZ_CACHE_DIR overrides the folder (QA and benchmarks).
     static func file(for root: String) -> String {
-        let dir = ProcessInfo.processInfo.environment["BZ_CACHE_DIR"] ?? {
+        let hash = SHA256.hash(data: Data(root.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(dir)/scan-\(hash).bzcache"
+    }
+
+    static var dir: String {
+        ProcessInfo.processInfo.environment["BZ_CACHE_DIR"] ?? {
             let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "dev.ahmed.blitztree").path
         }()
-        let hash = SHA256.hash(data: Data(root.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
-        return "\(dir)/scan-\(hash).bzcache"
+    }
+
+    /// "Save Results for Fast Launch" in the BlitzTree menu; on by default.
+    static let enabledKey = "bz.saveResults"
+    static var enabled: Bool { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
+
+    /// Every saved scan, including temp files a quit cut short.
+    static func savedFiles() -> [String] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        return names.filter { $0.hasPrefix("scan-") && $0.contains(".bzcache") }.map { "\(dir)/\($0)" }
+    }
+
+    static func savedBytes() -> UInt64 {
+        savedFiles().reduce(0) { sum, path in
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
+            return sum + (size ?? 0)
+        }
+    }
+
+    static func deleteAll() {
+        for path in savedFiles() { try? FileManager.default.removeItem(atPath: path) }
     }
 }
 
