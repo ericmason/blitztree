@@ -337,9 +337,16 @@ private struct ScanStatusBar: View {
     /// The last launch's results are on screen while a fresh scan runs.
     private func savedNote(_ tree: Tree) -> some View {
         let age = RelativeDateTimeFormatter().localizedString(for: tree.scannedAt, relativeTo: Date())
-        return Text("Results from \(age) · refreshing…")
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
+        // Above the other status text: when the bar runs out of room, this
+        // is the line that must stay readable.
+        return HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text("Results from \(age) · refreshing…")
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .layoutPriority(1)
     }
 }
 
