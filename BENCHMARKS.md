@@ -68,7 +68,8 @@ engine scan plus about 0.15 s to hand the tree to the UI.
 - zstd level 3 is the default. On the whole volume, level 1 makes a 385 MB file and level 9 a 249 MB file at 2.2× the save time.
 - File names are 60% of the file (178 MB of 297 MB on the whole volume). Larger zstd windows and long-distance matching shrank them by at most 9%.
 - Folder totals are recomputed on load. Storing them would add 13 MB (4%) to the whole-volume file and save less than 0.5 s of load time.
-- While the saved results show and a fresh scan runs, both trees are in memory, so peak memory is about twice a single scan's.
+- `bench cache-load <path>` with `BZ_CACHE_FILE=<file>` loads a saved file once and prints its peak memory; `BZ_CACHE_KEEP=<file>` makes `bench cache` keep the file it saved. On a whole-volume file (40,115,079 nodes, 298 MB, a 2,622 MB tree), loading peaks at a 2,778 MB memory footprint (`/usr/bin/time -l`), in 1.27–1.29 s warm. Before the loader streamed its per-node columns and mapped the file, the peak was 4,456 MB, at 1.25–1.54 s.
+- While the saved results show and a fresh scan runs, both trees are in memory, so peak memory is about twice a single scan's. BlitzTree shows saved results only when 18 times the file's size, about both trees, fits in half the Mac's RAM, and deletes a saved file that doesn't.
 
 ## Findings
 

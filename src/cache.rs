@@ -159,6 +159,7 @@ impl<'a> Varints<'a> {
         }
         Err(invalid("varint overflows"))
     }
+    #[cfg(test)]
     fn read<T>(&mut self, count: usize, f: impl Fn(u64) -> io::Result<T>) -> io::Result<Vec<T>> {
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
@@ -166,6 +167,7 @@ impl<'a> Varints<'a> {
         }
         Ok(out)
     }
+    #[cfg(test)]
     fn finish(&self) -> io::Result<()> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -449,10 +451,18 @@ pub fn decode(bytes: &[u8], root: &str, volume: [u8; 16]) -> io::Result<(Tree, S
         return Err(invalid("columns too large for the file size"));
     }
 
-    // Decompress every chunk of every column in parallel, in place.
-    let mut cols: Vec<Vec<u8>> = tables.iter().map(|(raw, _)| vec![0u8; *raw]).collect();
+    // Columns with one varint per node stream through a small buffer as they
+    // decode (below): unpacked whole, they would add hundreds of megabytes
+    // on a whole-disk scan. Every other column unpacks in place, its chunks
+    // in parallel.
+    let streamed = |c: usize| matches!(c, 0 | 1 | 2 | 3 | 6);
+    let mut cols: Vec<Vec<u8>> =
+        tables.iter().enumerate().map(|(c, (raw, _))| vec![0u8; if streamed(c) { 0 } else { *raw }]).collect();
     let mut jobs = Vec::new();
-    for (col, (_, chunks)) in cols.iter_mut().zip(&tables) {
+    for (c, (col, (_, chunks))) in cols.iter_mut().zip(&tables).enumerate() {
+        if streamed(c) {
+            continue;
+        }
         let mut rest = col.as_mut_slice();
         for &(len, frame) in chunks {
             let (dst, tail) = rest.split_at_mut(len);
@@ -470,55 +480,37 @@ pub fn decode(bytes: &[u8], root: &str, volume: [u8; 16]) -> io::Result<(Tree, S
     let unpacked = std::time::Instant::now();
 
     let mut t = Tree { errors, ..Default::default() };
-    let parent_of = |(i, v): (usize, u64)| {
-        match (i, (i as i64).checked_sub(unzigzag(v))) {
-            (0, Some(-1)) => Ok(NO_PARENT),
-            (1.., Some(p @ 0..)) if (p as usize) < i => Ok(p as u32),
-            _ => Err(invalid("bad parent")),
-        }
+    let parent_of = |i: usize, v: u64| match (i, (i as i64).checked_sub(unzigzag(v))) {
+        (0, Some(-1)) => Ok(NO_PARENT),
+        (1.., Some(p @ 0..)) if (p as usize) < i => Ok(p as u32),
+        _ => Err(invalid("bad parent")),
     };
-    // One value per node in each of these; they decode on every core.
-    let mut per_node = [0, 1, 2, 3, 6]
-        .into_par_iter()
-        .map(|c| {
-            let mut v = Varints::new(&cols[c]);
-            let out = v.read(n, Ok)?;
-            v.finish()?;
-            Ok(out)
-        })
-        .collect::<io::Result<Vec<Vec<u64>>>>()?;
-    let name_lens = per_node.pop().unwrap();
-    let logical = per_node.pop().unwrap();
-    let cloned = per_node.pop().unwrap();
-    let alloc = per_node.pop().unwrap();
-    let parents = per_node.pop().unwrap();
-    t.parents = parents.into_par_iter().enumerate().map(parent_of).collect::<io::Result<_>>()?;
-    // The UI subtracts unique from allocated bytes, so unique must not exceed it.
-    t.unique = alloc
-        .par_iter()
-        .zip(&cloned)
-        .map(|(&a, &c)| a.checked_sub(c).ok_or_else(|| invalid("more cloned bytes than allocated")))
-        .collect::<io::Result<_>>()?;
-    (t.alloc, t.logical) = (alloc, logical);
+    let names_len = cols[7].len() as u64;
+    // One value per node in each of these, decoded straight into the tree's
+    // own columns, one column per core. Whole-disk trees have tens of
+    // millions of nodes, so a u64 staging copy of each would cost gigabytes.
+    let ((parents, name_off), ((alloc, unique), logical)) = rayon::join(
+        || rayon::join(|| per_node(&tables[0].1, n, parent_of), || name_offsets(&tables[6].1, n, names_len)),
+        || {
+            rayon::join(
+                || rayon::join(|| per_node(&tables[1].1, n, |_, v| Ok(v)), || per_node(&tables[2].1, n, |_, v| Ok(v))),
+                || per_node(&tables[3].1, n, |_, v| Ok(v)),
+            )
+        },
+    );
+    (t.parents, t.name_off, t.alloc, t.unique, t.logical) = (parents?, name_off?, alloc?, unique?, logical?);
+    // The file stores cloned bytes; the tree keeps unique = alloc - cloned.
+    // The UI subtracts unique from allocated bytes, so it must not exceed it.
+    t.unique.par_iter_mut().zip(&t.alloc).try_for_each(|(u, &a)| {
+        *u = a.checked_sub(*u).ok_or_else(|| invalid("more cloned bytes than allocated"))?;
+        Ok::<_, io::Error>(())
+    })?;
     if cols[4].len() != n || cols[5].len() != n {
         return Err(invalid("flag column has the wrong length"));
     }
     t.flags = std::mem::take(&mut cols[4]);
     t.complete = cols[5].iter().map(|&c| c != 0).collect();
-
-    t.name_off = Vec::with_capacity(n + 1);
-    t.name_off.push(0);
-    let mut end = 0u64;
-    for len in name_lens {
-        end = end.saturating_add(len);
-        if end > cols[7].len() as u64 {
-            return Err(invalid("names run past the end"));
-        }
-        t.name_off.push(end as u32);
-    }
-    if end != cols[7].len() as u64 {
-        return Err(invalid("names don't add up"));
-    }
+    cols[5] = Vec::new();
     t.name_blob = std::mem::take(&mut cols[7]);
     // Paths are built by joining names, so each must be one real name.
     if t.name_bytes(0) != h.root.as_bytes() {
@@ -576,6 +568,82 @@ pub fn decode(bytes: &[u8], root: &str, volume: [u8; 16]) -> io::Result<(Tree, S
     Ok((t, h.scanned_at))
 }
 
+/// A column's varints, unpacked one chunk at a time into a buffer that
+/// holds that chunk plus the few bytes of a varint split across chunks.
+struct Stream<'a> {
+    chunks: &'a [(usize, &'a [u8])],
+    next_chunk: usize,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl<'a> Stream<'a> {
+    fn new(chunks: &'a [(usize, &'a [u8])]) -> Self {
+        Stream { chunks, next_chunk: 0, buf: Vec::new(), at: 0 }
+    }
+    fn next(&mut self) -> io::Result<u64> {
+        // A varint is at most 10 bytes.
+        while self.buf.len() - self.at < 10 && self.next_chunk < self.chunks.len() {
+            self.buf.drain(..self.at);
+            self.at = 0;
+            let (len, frame) = self.chunks[self.next_chunk];
+            self.next_chunk += 1;
+            let start = self.buf.len();
+            self.buf.resize(start + len, 0);
+            match zstd::bulk::decompress_to_buffer(frame, &mut self.buf[start..]) {
+                Ok(got) if got == len => {}
+                _ => return Err(invalid("damaged column")),
+            }
+        }
+        let mut v = Varints { bytes: &self.buf, at: self.at };
+        let value = v.next()?;
+        self.at = v.at;
+        Ok(value)
+    }
+    fn finish(&self) -> io::Result<()> {
+        if self.next_chunk == self.chunks.len() && self.at == self.buf.len() {
+            Ok(())
+        } else {
+            Err(invalid("column has extra bytes"))
+        }
+    }
+}
+
+/// Exactly `n` varints from a column, each turned into a value by `f(index, v)`.
+fn per_node<T>(
+    col: &[(usize, &[u8])],
+    n: usize,
+    f: impl Fn(usize, u64) -> io::Result<T>,
+) -> io::Result<Vec<T>> {
+    let mut v = Stream::new(col);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(f(i, v.next()?)?);
+    }
+    v.finish()?;
+    Ok(out)
+}
+
+/// Name offsets from `n` name lengths, which must add up to `names_len`.
+fn name_offsets(col: &[(usize, &[u8])], n: usize, names_len: u64) -> io::Result<Vec<u32>> {
+    let mut v = Stream::new(col);
+    let mut out = Vec::with_capacity(n + 1);
+    out.push(0);
+    let mut end = 0u64;
+    for _ in 0..n {
+        end = end.saturating_add(v.next()?);
+        if end > names_len {
+            return Err(invalid("names run past the end"));
+        }
+        out.push(end as u32);
+    }
+    v.finish()?;
+    if end != names_len {
+        return Err(invalid("names don't add up"));
+    }
+    Ok(out)
+}
+
 /// What rebuilding totals and child lists relies on, checked so a damaged
 /// file can't make them overflow or index out of bounds: the root is a
 /// folder, every parent is a folder, each folder's children are one run,
@@ -611,10 +679,48 @@ fn check_shape(t: &Tree) -> io::Result<()> {
 /// Load the cache at `src` if it belongs to a scan of `root` on the volume
 /// `root` is on now.
 pub fn load(src: &Path, root: &Path) -> io::Result<(Tree, SystemTime)> {
-    let bytes = std::fs::read(src)?;
     let root = root.to_str().ok_or_else(|| invalid("root path is not UTF-8"))?;
     let volume = volume_id(Path::new(root)).ok_or_else(|| invalid("can't identify the volume"))?;
-    decode(&bytes, root, volume)
+    let file = Mapped::open(src)?;
+    decode(file.bytes(), root, volume)
+}
+
+/// A file mapped read-only. Unlike a copy on the heap, its pages are backed
+/// by the file, so under memory pressure the system drops them instead of
+/// swapping.
+struct Mapped {
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl Mapped {
+    fn open(path: &Path) -> io::Result<Mapped> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(invalid("cache file is empty"));
+        }
+        // SAFETY: a fresh read-only private mapping of a file we opened; it
+        // stays valid after the descriptor closes. Saves replace the file
+        // by rename, so the mapped file itself is never rewritten.
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Mapped { ptr, len })
+    }
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping is `len` readable bytes until drop.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly the region mmap returned.
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
 }
 
 #[cfg(test)]
@@ -823,5 +929,23 @@ mod tests {
             assert_eq!(unzigzag(zigzag(d)), d);
         }
         assert!(Varints::new(&[0xff; 11]).next().is_err());
+    }
+
+    #[test]
+    fn streamed_varints_cross_chunk_boundaries() {
+        let values: Vec<u64> = (0..200).map(|i| if i % 3 == 0 { u64::MAX >> (i % 64) } else { i }).collect();
+        let bytes = varints(values.iter().copied(), 0);
+        // 7-byte chunks split most of the long varints.
+        let frames: Vec<(usize, Vec<u8>)> =
+            bytes.chunks(7).map(|c| (c.len(), zstd::bulk::compress(c, LEVEL).unwrap())).collect();
+        let chunks: Vec<(usize, &[u8])> = frames.iter().map(|(len, f)| (*len, f.as_slice())).collect();
+        assert_eq!(per_node(&chunks, values.len(), |_, v| Ok(v)).unwrap(), values);
+        // One value too few leaves bytes over; one too many runs out.
+        assert!(per_node(&chunks, values.len() - 1, |_, v| Ok(v)).is_err());
+        assert!(per_node(&chunks, values.len() + 1, |_, v| Ok(v)).is_err());
+        // A frame that unpacks to the wrong length is damage.
+        let mut short = chunks.clone();
+        short[3].0 += 1;
+        assert!(per_node(&short, values.len(), |_, v| Ok(v)).is_err());
     }
 }

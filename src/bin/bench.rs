@@ -10,6 +10,10 @@
 //!          naive       - serial read_dir + per-file lstat (Disk Inventory X style)
 //!          naive-par   - parallel read_dir + per-file lstat
 //!   BZ_TOP=1 also prints each top-level entry's allocated bytes (for diffing).
+//!          cache       - scan, then report saved-scan sizes and save/load times;
+//!                        BZ_CACHE_KEEP=<file> keeps the saved file
+//!          cache-load  - load BZ_CACHE_FILE, saved from a scan of <path>, once
+//!                        and print the peak memory
 //!   BZ_JSON=1 emits machine-readable totals and timing.
 
 use std::path::{Path, PathBuf};
@@ -157,6 +161,20 @@ fn main() {
                 tree.errors,
             )
         }
+        "cache-load" => {
+            let file = std::env::var("BZ_CACHE_FILE").expect("cache-load: set BZ_CACHE_FILE");
+            let before = peak_rss();
+            let t = Instant::now();
+            let (tree, _) = blitztree::cache::load(Path::new(&file), &path).expect("cache didn't load");
+            println!(
+                "cache-load: {} nodes in {:.3}s, peak memory {:.0} MB (was {:.0} MB before loading)",
+                tree.len(),
+                t.elapsed().as_secs_f64(),
+                peak_rss() as f64 / 1e6,
+                before as f64 / 1e6
+            );
+            (tree.n_files[0] as u64, 0, tree.alloc[0], tree.errors)
+        }
         m => {
             eprintln!("unknown mode {m}");
             std::process::exit(1);
@@ -253,7 +271,23 @@ fn cache_report(tree: &blitztree::Tree, root: &Path) {
         blitztree::ffi::bz_free(h);
     }
     println!("  load to usable: {:.3}s (best of 3)", best.as_secs_f64());
-    let _ = std::fs::remove_dir_all(&dir);
+    match std::env::var_os("BZ_CACHE_KEEP") {
+        Some(keep) => {
+            std::fs::rename(&file, &keep).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// The process's peak resident memory so far, in bytes.
+fn peak_rss() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    // macOS reports bytes.
+    usage.ru_maxrss as u64
 }
 
 #[derive(Default)]

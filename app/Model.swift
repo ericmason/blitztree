@@ -412,11 +412,11 @@ final class ScanModel {
     /// A missing or unusable file is skipped.
     private func showSavedScan(of root: String, scan: Int) {
         if savedOffered.isEmpty { Task.detached(priority: .utility) { ScanCache.removeAbandonedTemps() } }
-        guard ScanCache.enabled, savedOffered.insert(root).inserted else {
+        let file = ScanCache.file(for: root)
+        guard ScanCache.enabled, savedOffered.insert(root).inserted, ScanCache.fitsInMemory(file) else {
             handle = bz_scan_start(root)
             return
         }
-        let file = ScanCache.file(for: root)
         loadingSaved = FileManager.default.fileExists(atPath: file)
         Task {
             let saved = await Task.detached(priority: .userInitiated) { () -> Tree? in
@@ -488,6 +488,8 @@ final class ScanModel {
                     // Turned off or deleted while this scan finished.
                     guard ScanCache.enabled else { return }
                     if !result.save(to: file) { NSLog("BZ couldn't save the scan to %@", file) }
+                    // Too big for this Mac to show; don't keep it on disk.
+                    if !ScanCache.fitsInMemory(file) { try? FileManager.default.removeItem(atPath: file) }
                 }
             }
         }
@@ -558,6 +560,15 @@ nonisolated enum ScanCache {
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
             return sum + size
         }
+    }
+
+    /// Whether showing the saved results during the fresh scan leaves room:
+    /// both trees are in memory until it finishes. A whole-disk scan of 40M
+    /// nodes saved 298 MB and took 2.6 GB loaded and 2.7 GB scanning, so the
+    /// two take about 18 times the file's size. They may use half the RAM.
+    static func fitsInMemory(_ file: String) -> Bool {
+        let size = (try? FileManager.default.attributesOfItem(atPath: file)[.size] as? UInt64) ?? 0
+        return size * 18 <= ProcessInfo.processInfo.physicalMemory / 2
     }
 
     /// Held while a save writes and while saved results are deleted, so a
