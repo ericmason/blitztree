@@ -251,13 +251,19 @@ private struct ScanProgress: View {
     let model: ScanModel
     var body: some View {
         VStack(spacing: 14) {
-            Text(Fmt.size(model.bytes))
-                .font(.system(size: 44, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-            Text("\(Fmt.num(model.files)) files · \(Fmt.num(model.dirs)) folders · \(String(format: "%.2f", model.elapsed))s")
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(.secondary)
+            if model.loadingSaved {
+                Text("Loading last scan…")
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+            } else {
+                Text(Fmt.size(model.bytes))
+                    .font(.system(size: 44, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white)
+                Text("\(Fmt.num(model.files)) files · \(Fmt.num(model.dirs)) folders · \(String(format: "%.2f", model.elapsed))s")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
         }
         // No spinner: the counters are the progress, and a ProgressView is an
         // AppKit view whose insertion recomputed the window's key-view loop

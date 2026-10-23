@@ -320,6 +320,8 @@ final class ScanModel {
     }
     /// A tree has been shown at least once, so the views exist (see ContentView).
     var hasShownTree = false
+    /// The last scan's saved results are being read; the fresh scan waits.
+    var loadingSaved = false
     var viewRoot: Int = 0 {
         didSet {
             // A selection outside the folder on screen would read as over 100%.
@@ -407,6 +409,7 @@ final class ScanModel {
     /// A missing or unusable file is skipped.
     private func showSavedScan(of root: String, scan: Int) {
         let file = ScanCache.file(for: root)
+        loadingSaved = FileManager.default.fileExists(atPath: file)
         Task {
             let saved = await Task.detached(priority: .userInitiated) { () -> Tree? in
                 guard let h = bz_cache_load(file, root) else { return nil }
@@ -414,6 +417,7 @@ final class ScanModel {
                 if saved == nil { bz_free(h) }
                 return saved
             }.value
+            if scan == scanNumber { loadingSaved = false }
             if scan == scanNumber, scanning, handle == nil { handle = bz_scan_start(root) }
             guard let saved, scan == scanNumber, scanning, tree == nil else { return }
             tree = saved
