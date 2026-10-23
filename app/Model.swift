@@ -322,6 +322,9 @@ final class ScanModel {
     var hasShownTree = false
     /// The last scan's saved results are being read; the fresh scan waits.
     var loadingSaved = false
+    /// Roots whose saved results were already offered this session. A
+    /// rescan, often right after a trash, must not bring back the old tree.
+    @ObservationIgnored private var savedOffered: Set<String> = []
     var viewRoot: Int = 0 {
         didSet {
             // A selection outside the folder on screen would read as over 100%.
@@ -408,7 +411,8 @@ final class ScanModel {
     /// compete for every core and the saved scan took 5x longer to appear.
     /// A missing or unusable file is skipped.
     private func showSavedScan(of root: String, scan: Int) {
-        guard ScanCache.enabled else {
+        if savedOffered.isEmpty { Task.detached(priority: .utility) { ScanCache.removeAbandonedTemps() } }
+        guard ScanCache.enabled, savedOffered.insert(root).inserted else {
             handle = bz_scan_start(root)
             return
         }
@@ -480,7 +484,11 @@ final class ScanModel {
         if let result, ScanCache.enabled {
             let file = ScanCache.file(for: scanRoot)
             Task.detached(priority: .utility) {
-                if !result.save(to: file) { NSLog("BZ couldn't save the scan to %@", file) }
+                ScanCache.lock.withLock {
+                    // Turned off or deleted while this scan finished.
+                    guard ScanCache.enabled else { return }
+                    if !result.save(to: file) { NSLog("BZ couldn't save the scan to %@", file) }
+                }
             }
         }
         if ProcessInfo.processInfo.environment["BZ_TIMING"] != nil {
@@ -548,12 +556,29 @@ nonisolated enum ScanCache {
     static func savedBytes() -> UInt64 {
         savedFiles().reduce(0) { sum, path in
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
-            return sum + (size ?? 0)
+            return sum + size
         }
     }
 
+    /// Held while a save writes and while saved results are deleted, so a
+    /// save in flight can't put a file back after Delete Saved Results….
+    static let lock = NSLock()
+
     static func deleteAll() {
-        for path in savedFiles() { try? FileManager.default.removeItem(atPath: path) }
+        lock.withLock {
+            for path in savedFiles() { try? FileManager.default.removeItem(atPath: path) }
+        }
+    }
+
+    /// Temp files a quit cut short: `scan-<hash>.bzcache.tmp-<pid>-<n>`
+    /// whose process is gone.
+    static func removeAbandonedTemps() {
+        for path in savedFiles() {
+            guard let range = path.range(of: ".tmp-") else { continue }
+            let pid = path[range.upperBound...].split(separator: "-").first.flatMap { Int32($0) }
+            guard let pid, pid != getpid(), kill(pid, 0) != 0, errno == ESRCH else { continue }
+            try? FileManager.default.removeItem(atPath: path)
+        }
     }
 }
 

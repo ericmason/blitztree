@@ -61,10 +61,12 @@ struct UIHandoff {
                 NSLog("BZ trial %d begin", trial)
                 model.startScan(path: CommandLine.arguments[1])
                 var ticks = 0
+                var sawSaved = false
                 // BZ_UI_SAVED: end the run once the saved scan is on screen
                 // (pair with BZ_VOLUME_DELAY so the fresh one is still running).
                 let stopOnSaved = ProcessInfo.processInfo.environment["BZ_UI_SAVED"] != nil
                 while model.scanning {
+                    if model.showingSaved { sawSaved = true }
                     if stopOnSaved, model.showingSaved {
                         UIHandoffMetrics.engineDoneAt = UIHandoffMetrics.engineDoneAt ?? Date()
                         try? await Task.sleep(for: .milliseconds(500))
@@ -78,7 +80,7 @@ struct UIHandoff {
                 window.displayIfNeeded()
                 NSLog("BZ visible handoff: %.3f ms", -UIHandoffMetrics.engineDoneAt!.timeIntervalSinceNow * 1000)
                 verifyCells(window, model: model)
-                NSLog("BZ trial %d visible nodes=%d", trial, model.tree!.count)
+                NSLog("BZ trial %d visible nodes=%d saved shown=%d", trial, model.tree!.count, sawSaved ? 1 : 0)
                 if !model.showingSaved, let delay = ProcessInfo.processInfo.environment["BZ_VOLUME_DELAY"].flatMap(Double.init) {
                     precondition(ticks > Int(delay * 30), "Volume metadata blocked the main actor")
                     precondition(model.elapsed >= delay - 0.1, "Progress froze while waiting for metadata")
