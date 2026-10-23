@@ -642,13 +642,15 @@ struct OutlinePanel: NSViewRepresentable {
         }
     }
 
-    /// Right-click shows the same menu as the treemap and rings.
+    /// Right-click, Control-click and VoiceOver's show-menu action all ask
+    /// `menu(for:)`, so the list shows the treemap's menu for each.
     final class Outline: NSOutlineView {
-        override func rightMouseDown(with event: NSEvent) {
+        override func menu(for event: NSEvent) -> NSMenu? {
             let row = self.row(at: convert(event.locationInWindow, from: nil))
-            guard row >= 0, let it = item(atRow: row) as? Item else { return }
+            guard row >= 0, let it = item(atRow: row) as? Item else { return nil }
+            window?.makeFirstResponder(self)
             selectRowIndexes([row], byExtendingSelection: false)
-            NodeMenu.popUp(path: it.tree.path(it.id), with: event, for: self)
+            return NodeMenu.make(path: it.tree.path(it.id))
         }
     }
 

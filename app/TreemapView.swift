@@ -523,6 +523,10 @@ final class NodeMenu: NSObject {
     private static let shared = NodeMenu()
 
     static func popUp(path: String, with event: NSEvent, for view: NSView) {
+        NSMenu.popUpContextMenu(make(path: path), with: event, for: view)
+    }
+
+    static func make(path: String) -> NSMenu {
         let menu = NSMenu()
         for (title, action) in [("Reveal in Finder", #selector(revealInFinder(_:))),
                                 ("Copy Path", #selector(copyPath(_:))),
@@ -533,7 +537,7 @@ final class NodeMenu: NSObject {
             item.representedObject = path
             menu.addItem(item)
         }
-        NSMenu.popUpContextMenu(menu, with: event, for: view)
+        return menu
     }
 
     @objc private func revealInFinder(_ sender: NSMenuItem) {

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Right-click a file or folder in the list for the same menu as the treemap: Reveal in Finder, Copy Path, and Move to Trash.
+- Right-click or Control-click a file or folder in the list for the same menu as the treemap: Reveal in Finder, Copy Path, and Move to Trash.
 
 ## 0.5.6 — 2026-09-27
 
